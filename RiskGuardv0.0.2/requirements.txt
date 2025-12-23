@@ -1,0 +1,10 @@
+MetaTrader5==5.0.5430
+pywin32==306
+pywinauto==0.6.8
+requests==2.32.3
+pandas==1.5.3
+pytz==2024.1
+numpy==1.23.5
+matplotlib==3.7.3
+img2pdf==0.5.1
+investpy==1.0.8
