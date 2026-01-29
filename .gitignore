@@ -56,3 +56,4 @@ logs/
 .DS_Store
 Thumbs.db
 *.lnk
+!RiskguardV1.1/RiskGuard UI.lnk
