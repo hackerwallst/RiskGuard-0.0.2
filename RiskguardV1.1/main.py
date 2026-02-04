@@ -17,6 +17,55 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+# --- single-instance lock (evita múltiplos loops rodando) ---
+LOCK_FILE = os.path.join(ROOT, ".rg_main.lock")
+LOCK_STALE_SEC = 20
+
+def _read_lock() -> Dict[str, Any]:
+    try:
+        if os.path.exists(LOCK_FILE):
+            with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return {}
+
+def _write_lock() -> None:
+    try:
+        payload = {"pid": os.getpid(), "ts": time.time()}
+        with open(LOCK_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _release_lock() -> None:
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception:
+        pass
+
+def _acquire_single_instance() -> None:
+    now = time.time()
+    data = _read_lock()
+    last_ts = float(data.get("ts") or 0.0)
+    other_pid = int(data.get("pid") or 0)
+    if other_pid and other_pid != os.getpid() and (now - last_ts) < LOCK_STALE_SEC:
+        print("⚠️ RiskGuard já está rodando (lock ativo). Fechando esta instância.", flush=True)
+        raise SystemExit(0)
+    _write_lock()
+
+def _ensure_lock_owner() -> bool:
+    now = time.time()
+    data = _read_lock()
+    last_ts = float(data.get("ts") or 0.0)
+    owner_pid = int(data.get("pid") or 0)
+    if owner_pid and owner_pid != os.getpid() and (now - last_ts) < LOCK_STALE_SEC:
+        return False
+    return True
+
 # ====== Módulos do projeto ======
 try:
     from mt5_reader import RiskGuardMT5Reader
@@ -495,31 +544,16 @@ def _sleep_backoff(base: float, cap: float):
 def main():
     print("🔌 Iniciando RiskGuard...", flush=True)
 
+    _acquire_single_instance()
+
     terminal_path = _select_terminal_path(DEFAULT_TERMINAL_PATH)
     reader = RiskGuardMT5Reader(path=terminal_path)
 
-    # Conexão com backoff
+    # Conexão com backoff (não bloqueia o loop)
+    connected = False
     attempts = 0
     backoff = _sleep_backoff(base=3, cap=CONNECT_BACKOFF_MAX)
-    while True:
-        try:
-            attempts += 1
-            ok = reader.connect()
-            if ok:
-                print("✅ Conectado ao MT5.", flush=True)
-                break
-            else:
-                print(f"❌ connect() retornou False (tentativa {attempts}). Verifique login e caminho:\n{terminal_path}",
-                      flush=True)
-        except Exception as e:
-            print(f"❌ Erro conectando ao MT5 (tentativa {attempts}): {e}", flush=True)
-        time.sleep(next(backoff))
-
-    # Ident para notificações
-    try:
-        set_ident_from_snapshot(reader.snapshot(), label="RiskGuard")
-    except Exception:
-        pass
+    next_connect_ts = 0.0
 
     state = _load_json(STATE_FILE, {})
     state.setdefault("telegram_offset", None)
@@ -533,38 +567,11 @@ def main():
     while True:
         loop_start = time.time()
         try:
-            # === NEW: não interfere enquanto o guard estiver fechando ordens ===
-            if os.path.exists(os.path.join(ROOT, ".guard_lock")):
-                time.sleep(1)
-                continue
-            try:
-                snap = reader.snapshot()
-                snapshot_fails = 0
-            except Exception as e:
-                snapshot_fails += 1
-                print(f"❌ snapshot() falhou ({snapshot_fails}/{SNAPSHOT_MAX_FAILS_BEFORE_RECONNECT}): {e}", flush=True)
-                log_event("ERROR", {"err": repr(e), "stage": "snapshot"}, {"module": "reader"})
-                if snapshot_fails >= SNAPSHOT_MAX_FAILS_BEFORE_RECONNECT:
-                    rb = _sleep_backoff(base=2, cap=20)
-                    re_ok = False
-                    for _ in range(4):
-                        try:
-                            if reader.connect():
-                                re_ok = True
-                                print("🔄 Reconectado ao MT5 após falhas de snapshot.", flush=True)
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(next(rb))
-                    snapshot_fails = 0 if re_ok else snapshot_fails
-                time.sleep(5)
-                continue
-
-            acct = snap.get("account") or {}
-            eq = _fmt_money(acct.get("equity"))
-            positions = snap.get("positions") or []
-            tickets = [int(p.get("ticket", 0)) for p in positions if p.get("ticket") is not None]
-
+            if not _ensure_lock_owner():
+                print("⚠️ Outra instância ativa detectada. Encerrando esta.", flush=True)
+                break
+            _write_lock()
+            # --- Telegram polling independente do snapshot ---
             telegram_msgs: List[Dict[str, Any]] = []
             if TELEGRAM_COMMANDS:
                 if not state.get("telegram_synced"):
@@ -576,6 +583,10 @@ def main():
                 else:
                     now_ts = time.time()
                     last_poll = float(state.get("telegram_last_poll") or 0.0)
+                    # Corrige skew de relógio: se last_poll está no futuro, reseta
+                    if last_poll > now_ts + 30:
+                        last_poll = 0.0
+                        state["telegram_last_poll"] = 0.0
                     if now_ts - last_poll >= TELEGRAM_COMMANDS_POLL_SECONDS:
                         telegram_msgs, next_offset = telegram_poll_chat_messages(
                             state.get("telegram_offset"), timeout=0
@@ -585,9 +596,61 @@ def main():
                         state["telegram_last_poll"] = now_ts
                 if telegram_msgs:
                     try:
+                        log_event("TELEGRAM_POLL", {
+                            "count": len(telegram_msgs),
+                            "texts": [m.get("text") for m in telegram_msgs[:3]],
+                        }, {"module": "telegram"})
+                    except Exception:
+                        pass
+                    try:
                         handle_telegram_commands(reader, telegram_msgs)
                     except Exception as e:
                         log_event("ERROR", {"err": repr(e)}, {"module": "telegram_commands"})
+            # --- tenta (re)conectar ao MT5 sem bloquear o loop ---
+            now_ts = time.time()
+            if not connected and now_ts >= next_connect_ts:
+                try:
+                    attempts += 1
+                    ok = reader.connect()
+                except Exception as e:
+                    ok = False
+                    print(f"❌ Erro conectando ao MT5 (tentativa {attempts}): {e}", flush=True)
+                if ok:
+                    connected = True
+                    attempts = 0
+                    backoff = _sleep_backoff(base=3, cap=CONNECT_BACKOFF_MAX)
+                    print("✅ Conectado ao MT5.", flush=True)
+                    try:
+                        set_ident_from_snapshot(reader.snapshot(), label="RiskGuard")
+                    except Exception:
+                        pass
+                else:
+                    wait = next(backoff)
+                    next_connect_ts = now_ts + float(wait)
+                    if attempts % 3 == 1:
+                        print(f"⚠️ MT5 indisponível. Nova tentativa em ~{int(wait)}s.", flush=True)
+            # === NEW: não interfere enquanto o guard estiver fechando ordens ===
+            if os.path.exists(os.path.join(ROOT, ".guard_lock")):
+                time.sleep(1)
+                continue
+            if not connected:
+                time.sleep(1)
+                continue
+            try:
+                snap = reader.snapshot()
+                snapshot_fails = 0
+            except Exception as e:
+                snapshot_fails += 1
+                connected = False
+                print(f"❌ snapshot() falhou ({snapshot_fails}/{SNAPSHOT_MAX_FAILS_BEFORE_RECONNECT}): {e}", flush=True)
+                log_event("ERROR", {"err": repr(e), "stage": "snapshot"}, {"module": "reader"})
+                time.sleep(2)
+                continue
+
+            acct = snap.get("account") or {}
+            eq = _fmt_money(acct.get("equity"))
+            positions = snap.get("positions") or []
+            tickets = [int(p.get("ticket", 0)) for p in positions if p.get("ticket") is not None]
 
             # Notificações de trade open/close + baseline (primeiro loop é silencioso)
             try:
@@ -749,6 +812,7 @@ def main():
         reader.shutdown()
     except Exception:
         pass
+    _release_lock()
     print("🛑 RiskGuard finalizado.", flush=True)
 
 if __name__ == "__main__":

@@ -67,6 +67,10 @@ def _sleep_antiflood():
         if _LAST_SENT_FILE.exists():
             last = float(_LAST_SENT_FILE.read_text().strip() or "0")
         now = time.time()
+        # Se o relógio do sistema estava errado, o timestamp pode ficar no futuro.
+        # Nesses casos, evita dormir por minutos/horas.
+        if last > now + 30:
+            last = now
         wait = (last + _MIN_INTERVAL_S) - now
         if wait > 0:
             time.sleep(wait)
@@ -81,7 +85,7 @@ def _send_text(text: str) -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     text = text if len(text) <= 3900 else (text[:3900] + "\n…(truncado)…")
     try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"})
+        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
         if r.status_code != 200:
             print("[notify] falha:", r.status_code, r.text[:200])
             return False
@@ -315,7 +319,7 @@ def send_document(file_path: str, caption: str = "") -> bool:
         with open(file_path, "rb") as f:
             files = {"document": (Path(file_path).name, f)}
             data = {"chat_id": CHAT_ID, "caption": caption}
-            r = requests.post(url, data=data, files=files)
+            r = requests.post(url, data=data, files=files, timeout=30)
         if r.status_code != 200:
             print("[notify] falha sendDocument:", r.status_code, r.text[:200])
             return False

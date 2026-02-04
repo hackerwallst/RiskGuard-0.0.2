@@ -264,7 +264,7 @@ def modify_position_sltp(ticket: int, symbol: str, sl: Optional[float], tp: Opti
             },
             "last_error": mt5.last_error(),
         }
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        if result and result.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL, 10025):
             return True, {"mode": "api", **payload}
 
         if not _is_autotrading_disabled(payload):
@@ -289,7 +289,7 @@ def modify_position_sltp(ticket: int, symbol: str, sl: Optional[float], tp: Opti
         ensure_autotrading_off()
         time.sleep(0.40)
 
-        ok2 = bool(result2 and result2.retcode == mt5.TRADE_RETCODE_DONE)
+        ok2 = bool(result2 and result2.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_DONE_PARTIAL, 10025))
         return (True, {"mode": "api+toggle_hotkey", "uia_on": toggled_on, **payload2}) if ok2 \
                else (False, {"mode": "api+toggle_hotkey", "uia_on": toggled_on, **payload2})
 

@@ -17,7 +17,10 @@ TERMINAL_CFG_PATH = ROOT / ".rg_terminal.json"
 ASSETS_DIR = ROOT / "UI Figma" / "Icons"
 MAIN_PATH = ROOT / "main.py"
 SETUP_SCRIPT = ROOT / "setup_riskguard.ps1"
+UPDATE_SCRIPT = ROOT / "update_riskguard.py"
 LOG_DIR = ROOT / "logger" / "logs"
+LOCK_FILE = ROOT / ".rg_main.lock"
+UPDATE_STATUS_PATH = ROOT / ".rg_update_status.json"
 
 LOCALE_DOT = QtCore.QLocale(QtCore.QLocale.English, QtCore.QLocale.UnitedStates)
 
@@ -366,6 +369,7 @@ class RiskGuardUI(QtWidgets.QMainWindow):
         self._status_timer.start()
         self._update_run_state()
         self._refresh_status()
+        self._show_update_status()
 
     def _build_header(self) -> QtWidgets.QWidget:
         header = QtWidgets.QFrame()
@@ -406,6 +410,11 @@ class RiskGuardUI(QtWidgets.QMainWindow):
         self.save_btn.setObjectName("saveButton")
         self.save_btn.clicked.connect(self._save)
         layout.addWidget(self.save_btn)
+
+        self.update_btn = QtWidgets.QPushButton("Atualizar")
+        self.update_btn.setObjectName("updateButton")
+        self.update_btn.clicked.connect(self._update_riskguard)
+        layout.addWidget(self.update_btn)
 
         self.run_btn = QtWidgets.QPushButton("Iniciar RiskGuard")
         self.run_btn.setObjectName("runButton")
@@ -462,6 +471,11 @@ class RiskGuardUI(QtWidgets.QMainWindow):
         self.activateWindow()
 
     def _exit_app(self) -> None:
+        # Garante que o loop principal pare ao sair pela bandeja.
+        try:
+            self._stop_riskguard()
+        except Exception:
+            pass
         self._allow_close = True
         QtWidgets.QApplication.instance().quit()
 
@@ -495,6 +509,43 @@ class RiskGuardUI(QtWidgets.QMainWindow):
         else:
             self._start_riskguard()
 
+    def _update_riskguard(self) -> None:
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Atualizacao",
+            "O RiskGuard sera fechado e atualizado. O aplicativo sera reiniciado. Deseja continuar?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+
+        try:
+            self._stop_riskguard()
+        except Exception:
+            pass
+
+        if not UPDATE_SCRIPT.exists():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Atualizacao",
+                "Arquivo update_riskguard.py nao encontrado.",
+            )
+            return
+
+        python_exe = self._riskguard_python()
+        args = [str(python_exe), str(UPDATE_SCRIPT), "--restart-ui"]
+        flags = 0
+        if os.name == "nt":
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        try:
+            subprocess.Popen(args, cwd=str(ROOT), creationflags=flags)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Atualizacao", f"Falha ao iniciar atualizacao: {exc}")
+            return
+
+        self._allow_close = True
+        QtWidgets.QApplication.instance().quit()
+
     def _start_riskguard(self) -> None:
         terminal = self.terminal_path.text().strip()
         if terminal and not os.path.exists(terminal):
@@ -509,6 +560,14 @@ class RiskGuardUI(QtWidgets.QMainWindow):
                 self,
                 "MetaTrader 5",
                 "Defina o caminho do terminal MT5 antes de iniciar o RiskGuard.",
+            )
+            return
+
+        if _is_main_running_via_lock():
+            QtWidgets.QMessageBox.information(
+                self,
+                "RiskGuard",
+                "O RiskGuard já está rodando. Feche a instância atual antes de iniciar outra.",
             )
             return
 
@@ -557,16 +616,27 @@ class RiskGuardUI(QtWidgets.QMainWindow):
         self._update_run_state()
 
     def _stop_riskguard(self) -> None:
-        if not self._rg_process:
-            return
-        try:
-            self._rg_process.terminate()
-            self._rg_process.wait(timeout=5)
-        except Exception:
+        pid = None
+        if self._rg_process:
             try:
-                self._rg_process.kill()
+                pid = int(self._rg_process.pid or 0)
             except Exception:
-                pass
+                pid = None
+            try:
+                self._rg_process.terminate()
+                self._rg_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._rg_process.kill()
+                except Exception:
+                    pass
+        # Mata a árvore (evita pythonw órfão).
+        if pid:
+            _taskkill_tree(pid)
+        # Se existir lock, encerra também o PID registrado.
+        lock_pid = _get_lock_pid()
+        if lock_pid and (pid is None or lock_pid != pid):
+            _taskkill_tree(lock_pid)
         self._rg_process = None
         self._update_run_state()
 
@@ -598,6 +668,32 @@ class RiskGuardUI(QtWidgets.QMainWindow):
             self.status_err.setText(last_error or "Sem erros recentes")
         if hasattr(self, "status_updated"):
             self.status_updated.setText(QtCore.QDateTime.currentDateTime().toString("dd/MM/yyyy HH:mm:ss"))
+
+    def _show_update_status(self) -> None:
+        if not UPDATE_STATUS_PATH.exists():
+            return
+        data: Optional[Dict[str, Any]] = None
+        try:
+            data = json.loads(UPDATE_STATUS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+        try:
+            UPDATE_STATUS_PATH.unlink()
+        except Exception:
+            pass
+        if not isinstance(data, dict):
+            return
+        ok = bool(data.get("ok"))
+        msg = str(data.get("message") or "").strip()
+        version = str(data.get("version") or "").strip()
+        if version:
+            msg = f"{msg} (versao: {version})" if msg else f"Versao: {version}"
+        if not msg:
+            msg = "Atualizacao concluida." if ok else "Falha na atualizacao."
+        if ok:
+            QtWidgets.QMessageBox.information(self, "Atualizacao", msg)
+        else:
+            QtWidgets.QMessageBox.warning(self, "Atualizacao", msg)
 
     def _add_row(self, layout: QtWidgets.QVBoxLayout, label_text: str, field: QtWidgets.QWidget) -> None:
         row = QtWidgets.QHBoxLayout()
@@ -819,6 +915,16 @@ class RiskGuardUI(QtWidgets.QMainWindow):
             }
             QPushButton#saveButton:hover {
                 background: #059669;
+            }
+            QPushButton#updateButton {
+                background: #2563eb;
+                color: #ffffff;
+                border-radius: 6px;
+                padding: 8px 14px;
+                font-weight: 600;
+            }
+            QPushButton#updateButton:hover {
+                background: #1d4ed8;
             }
             QPushButton#runButton {
                 background: #10b981;
@@ -1105,6 +1211,65 @@ def _is_mt5_running() -> bool:
         return "terminal64.exe" in output.lower()
     except Exception:
         return False
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}"],
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        ).decode(errors="ignore")
+        return str(pid) in output
+    except Exception:
+        return False
+
+
+def _is_main_running_via_lock() -> bool:
+    try:
+        if not LOCK_FILE.exists():
+            return False
+        data = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        pid = int(data.get("pid") or 0)
+        if pid and _pid_alive(pid):
+            return True
+    except Exception:
+        pass
+    # lock stale
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
+    return False
+
+
+def _get_lock_pid() -> int:
+    try:
+        if not LOCK_FILE.exists():
+            return 0
+        data = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+        return int(data.get("pid") or 0)
+    except Exception:
+        return 0
+
+
+def _taskkill_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            timeout=6,
+        )
+    except Exception:
+        pass
 
 
 def _last_error_line() -> Optional[str]:

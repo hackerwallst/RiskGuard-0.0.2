@@ -8,6 +8,7 @@ RiskguardV1.1/.rg_state.json
 RiskguardV1.1/.rg_pertrade_interactive.json
 RiskguardV1.1/.rg_terminal.json
 RiskguardV1.1/.rg_*.json
+RiskguardV1.1/.rg_main.lock
 RiskguardV1.1/.guard_lock
 RiskguardV1.1/notify/.notify_last.txt
 RiskguardV1.1/limits/.guard_breach_cache.json

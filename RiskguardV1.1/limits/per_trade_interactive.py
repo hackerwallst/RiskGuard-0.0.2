@@ -128,6 +128,19 @@ def _round_price(price: float, digits: int) -> float:
         return float(price)
 
 
+def _is_no_changes_result(res: Any) -> bool:
+    """
+    Detecta retorno "No changes" do MT5 para tratar como sucesso.
+    """
+    try:
+        result = (res or {}).get("result") or {}
+        rc = result.get("retcode")
+        comment = str(result.get("comment") or "").lower()
+        return rc == 10025 or "no changes" in comment
+    except Exception:
+        return False
+
+
 def _compute_sl_for_risk(pos: Dict[str, Any], equity: float, max_risk_pct: float) -> Tuple[Optional[float], str]:
     """
     Calcula um SL alvo (preço) para manter o risco ≤ max_risk_pct.
@@ -198,6 +211,27 @@ def _select_pending_ticket(tickets_state: Dict[str, Any]) -> Optional[str]:
     return candidates[0][1]
 
 
+def _extract_decision(text: Any) -> Optional[str]:
+    """
+    Extrai decisão "1" ou "2" de mensagens que não vêm exatamente como "1"/"2".
+    Aceita: "1", "2", "1.", "2 - manter", "opcao 1" etc.
+    """
+    try:
+        s = str(text or "").strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    if s in ("1", "2"):
+        return s
+    if s[0] in ("1", "2"):
+        return s[0]
+    for ch in s:
+        if ch in ("1", "2"):
+            return ch
+    return None
+
+
 def enforce_per_trade_interactive_sl(
     reader: RiskGuardMT5Reader,
     max_risk_pct: float,
@@ -261,6 +295,11 @@ def enforce_per_trade_interactive_sl(
         else:
             msgs = list(incoming_messages)
             next_offset = incoming_next_offset
+            if not msgs:
+                extra_msgs, extra_offset = telegram_poll_chat_messages(state.get("telegram_offset"))
+                if extra_msgs:
+                    msgs = extra_msgs
+                    next_offset = extra_offset
         if next_offset is not None:
             state["telegram_offset"] = next_offset
 
@@ -274,12 +313,14 @@ def enforce_per_trade_interactive_sl(
                 continue
             msg_date = m.get("date")
             if isinstance(msg_date, int) and min_ts:
-                # Evita aplicar mensagens antigas ("1"/"2" do passado)
-                if msg_date < int(min_ts) - 1:
+                # Tolerância a skew de relógio (Telegram usa epoch UTC).
+                # Só descarta se for MUITO mais antigo que o prompt.
+                if msg_date < int(min_ts) - (6 * 3600):
                     continue
-            s = (m.get("text") or "").strip()
-            if s in ("1", "2"):
-                decision = s
+            s = m.get("text")
+            d = _extract_decision(s)
+            if d in ("1", "2"):
+                decision = d
 
         if decision == "1":
             if _coerce_float(st.get("sl_original")) is None:
@@ -503,7 +544,13 @@ def enforce_per_trade_interactive_sl(
             continue
 
         ok, res = modify_position_sltp(ticket=ticket, symbol=symbol, sl=sl_target_rounded, tp=tp_now, comment="RG ajusta SL")
+        if not ok and _is_no_changes_result(res):
+            ok = True
         if ok:
+            # Se antes falhou (ex.: AutoTrading OFF) e agora conseguiu, volta para pending.
+            if st.get("status") == "adjust_failed":
+                st.pop("adjust_failed_reason", None)
+            st["status"] = "pending"
             st["sl_adjusted"] = float(sl_target_rounded)
             st["adjusted_at"] = now
             tickets_state[tk] = st

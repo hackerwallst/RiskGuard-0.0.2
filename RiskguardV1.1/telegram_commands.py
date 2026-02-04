@@ -246,7 +246,14 @@ def _parse_report_choice(args: Optional[List[str]]) -> Optional[str]:
 
 
 def _send_status(reader: RiskGuardMT5Reader) -> None:
-    snap = reader.snapshot()
+    try:
+        snap = reader.snapshot()
+    except Exception as exc:
+        send_alert("STATUS", [
+            "❌ MT5 desconectado ou indisponível no momento.",
+            f"Detalhe: {repr(exc)}",
+        ])
+        return
     acc = snap.get("account") or {}
     exp = snap.get("exposure") or {}
     positions = snap.get("positions") or []
@@ -276,7 +283,14 @@ def _send_status(reader: RiskGuardMT5Reader) -> None:
 
 
 def _send_positions(reader: RiskGuardMT5Reader) -> None:
-    snap = reader.snapshot()
+    try:
+        snap = reader.snapshot()
+    except Exception as exc:
+        send_alert("POSITIONS", [
+            "❌ MT5 desconectado ou indisponível no momento.",
+            f"Detalhe: {repr(exc)}",
+        ])
+        return
     positions = snap.get("positions") or []
 
     if not positions:
@@ -327,7 +341,14 @@ def _send_history(reader: RiskGuardMT5Reader) -> None:
         log_event("ERROR", {"err": err}, {"module": "reports_import"})
         return
 
-    reader.ensure_connection()
+    try:
+        reader.ensure_connection()
+    except Exception as exc:
+        send_alert("HISTORY", [
+            "❌ MT5 desconectado ou indisponível no momento.",
+            f"Detalhe: {repr(exc)}",
+        ])
+        return
     deals = reports_mod.fetch_deals(reader, since, until)
     trades = reports_mod.group_trades(deals)
     trades.sort(key=lambda t: t.get("end", ""))
@@ -424,7 +445,14 @@ def _send_report(reader: RiskGuardMT5Reader, args: Optional[List[str]] = None) -
         return
 
     start_ts = time.time()
-    reader.ensure_connection()
+    try:
+        reader.ensure_connection()
+    except Exception as exc:
+        send_alert("RELATORIO", [
+            "❌ MT5 desconectado ou indisponível no momento.",
+            f"Detalhe: {repr(exc)}",
+        ])
+        return
     try:
         reports_mod.build_report(reader, since=since, until=until, notify=False)
     except Exception as exc:
