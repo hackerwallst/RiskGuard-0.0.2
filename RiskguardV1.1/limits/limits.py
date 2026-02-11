@@ -1,7 +1,7 @@
-# limits.py — Função 3: risco agregado ≤ 5%; bloquear novas aberturas; 3 tentativas -> bloqueio lógico
+# limits.py — Função 3: risco agregado <= limite; tentativas + bloqueio temporário de AutoTrading
 from __future__ import annotations
 from typing import Any, Dict, List, Set
-from datetime import datetime
+from datetime import datetime, timedelta
 import os, json
 import pytz
 from rg_config import get_float, get_int
@@ -10,11 +10,13 @@ from notify import notify_limits
 
 from mt5_reader import RiskGuardMT5Reader
 from .guard import close_position_full
+from .kill_switch import set_kill_until, kill_status
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, ".riskguard_limits.json")
 DEFAULT_THRESHOLD_PCT = get_float("AGGREGATE_MAX_RISK", 5.0)
 DEFAULT_MAX_ATTEMPTS = get_int("AGGREGATE_MAX_ATTEMPTS", 3)
+DEFAULT_BLOCK_MINUTES = get_int("AGGREGATE_BLOCK_MINUTES", 60)
 
 # ---------------------------
 # Estado persistente simples
@@ -35,19 +37,30 @@ def _save_state(d: Dict[str, Any]) -> None:
 def _now_utc():
     return datetime.utcnow().replace(tzinfo=pytz.UTC)
 
+def _from_iso_any(v: Any):
+    if not isinstance(v, str) or not v.strip():
+        return None
+    try:
+        if v.endswith("Z"):
+            return datetime.fromisoformat(v.replace("Z", "+00:00"))
+        return datetime.fromisoformat(v)
+    except Exception:
+        return None
+
 # ---------------------------
 # API pública (Função 3)
 # ---------------------------
 def enforce_aggregate_risk(reader: RiskGuardMT5Reader,
                            threshold_pct: float = DEFAULT_THRESHOLD_PCT,
-                           max_block_attempts: int = DEFAULT_MAX_ATTEMPTS) -> Dict[str, Any]:
+                           max_block_attempts: int = DEFAULT_MAX_ATTEMPTS,
+                           block_minutes: int = DEFAULT_BLOCK_MINUTES) -> Dict[str, Any]:
     """
     Regras:
-      - Se total_risk_pct <= threshold: atualiza baseline (tickets atuais), zera tentativas e remove bloqueio lógico.
+      - Se total_risk_pct <= threshold: atualiza baseline (tickets atuais), sem zerar tentativas imediatamente.
       - Se total_risk_pct > threshold: qualquer NOVO ticket (não presente no baseline) é fechado.
         Cada novo ticket conta 1 tentativa. Ao atingir max_block_attempts -> risk_block_active=True.
-      - Enquanto risk_block_active=True, o módulo continua fechando novos tickets; o bloqueio cai
-        automaticamente assim que total_risk_pct <= threshold.
+      - Ao atingir max_block_attempts, desativa AutoTrading por block_minutes via kill_switch.
+      - Tentativas expiram após block_minutes sem novas violações.
 
     Retorna um relatório com estado e ações tomadas.
     """
@@ -58,7 +71,21 @@ def enforce_aggregate_risk(reader: RiskGuardMT5Reader,
     st = _load_state()
     baseline: List[int] = st.get("baseline_tickets") or []
     attempts: int = int(st.get("block_attempts", 0))
-    risk_block_active: bool = bool(st.get("risk_block_active", False))
+    last_attempt_at = _from_iso_any(st.get("last_attempt_at"))
+
+    ks_before = kill_status()
+    kill_active_before = bool(ks_before.get("active"))
+    kill_until_before = ks_before.get("until")
+    risk_block_active: bool = bool(st.get("risk_block_active", False)) or kill_active_before
+
+    # Evita carregar tentativa antiga por tempo indefinido:
+    # se ficou sem novas violações por "block_minutes", zera o contador.
+    if attempts > 0 and last_attempt_at is not None:
+        idle_sec = (_now_utc() - last_attempt_at).total_seconds()
+        if idle_sec >= max(1, int(block_minutes)) * 60:
+            attempts = 0
+            st["block_attempts"] = 0
+            st["last_attempt_at"] = None
 
     report: Dict[str, Any] = {
         "now_utc": _now_utc().isoformat(),
@@ -72,29 +99,41 @@ def enforce_aggregate_risk(reader: RiskGuardMT5Reader,
         "attempts_before": attempts,
         "attempts_after": attempts,
         "risk_block_active_before": risk_block_active,
-        "risk_block_active_after": risk_block_active
+        "risk_block_active_after": risk_block_active,
+        "kill_switch_active_before": kill_active_before,
+        "kill_switch_active_after": kill_active_before,
+        "kill_switch_until_before": kill_until_before,
+        "kill_switch_until_after": kill_until_before,
+        "kill_switch_armed_now": False,
+        "block_minutes": int(block_minutes),
     }
 
     # Primeira execução: cria baseline e não fecha nada
     if not baseline:
         st["baseline_tickets"] = sorted(list(tickets_current))
-        st["block_attempts"] = 0
-        st["risk_block_active"] = False
+        st["block_attempts"] = attempts
+        st["risk_block_active"] = risk_block_active
         _save_state(st)
         report["baseline_tickets"] = st["baseline_tickets"]
-        report["attempts_after"] = 0
-        report["risk_block_active_after"] = False
+        report["attempts_after"] = attempts
+        report["risk_block_active_after"] = risk_block_active
         return report
 
-    # Se risco agregado está OK, atualiza baseline e limpa bloqueio/tentativas
+    # Se risco agregado está OK, atualiza baseline.
+    # Não zera tentativas aqui para evitar "Tentativas EA: 1" em loop de abre/fecha.
     if total <= (threshold_pct + 1e-9):
+        # Se o kill-switch já expirou e havia bloqueio ativo, faz reset limpo do ciclo.
+        if risk_block_active and (not kill_active_before):
+            attempts = 0
+            st["last_attempt_at"] = None
+            risk_block_active = False
         st["baseline_tickets"] = sorted(list(tickets_current))
-        st["block_attempts"] = 0
-        st["risk_block_active"] = False
+        st["block_attempts"] = attempts
+        st["risk_block_active"] = risk_block_active
         _save_state(st)
         report["baseline_tickets"] = st["baseline_tickets"]
-        report["attempts_after"] = 0
-        report["risk_block_active_after"] = False
+        report["attempts_after"] = attempts
+        report["risk_block_active_after"] = risk_block_active
         return report
 
     # Risco agregado excedido -> fechar apenas NOVOS tickets
@@ -120,13 +159,37 @@ def enforce_aggregate_risk(reader: RiskGuardMT5Reader,
             report["failed"].append({"ticket": t, "symbol": pos["symbol"], "result": res})
 
     # Contabiliza tentativas (1 por novo ticket detectado)
-    attempts += len(new_tickets)
+    if new_tickets:
+        attempts += len(new_tickets)
+        st["last_attempt_at"] = _now_utc().isoformat()
     st["block_attempts"] = attempts
     report["attempts_after"] = attempts
 
-    # Ativa bloqueio lógico após X tentativas
+    # Ativa bloqueio lógico/físico (AutoTrading OFF) após X tentativas
     if attempts >= max_block_attempts:
         risk_block_active = True
+        if not kill_active_before:
+            until = _now_utc() + timedelta(minutes=max(1, int(block_minutes)))
+            try:
+                set_kill_until(until)
+                ks_after = kill_status()
+                report["kill_switch_armed_now"] = True
+                report["kill_switch_active_after"] = bool(ks_after.get("active"))
+                report["kill_switch_until_after"] = ks_after.get("until")
+            except Exception:
+                report["kill_switch_active_after"] = False
+                report["kill_switch_until_after"] = None
+
+    # Se não armou kill agora, mantém o status atual observado
+    if not report["kill_switch_armed_now"]:
+        ks_after = kill_status()
+        report["kill_switch_active_after"] = bool(ks_after.get("active"))
+        report["kill_switch_until_after"] = ks_after.get("until")
+
+    # Enquanto kill_switch estiver ativo, bloqueio de risco é considerado ativo
+    if report["kill_switch_active_after"]:
+        risk_block_active = True
+
     st["risk_block_active"] = risk_block_active
     report["risk_block_active_after"] = risk_block_active
 
@@ -137,10 +200,13 @@ def enforce_aggregate_risk(reader: RiskGuardMT5Reader,
 def risk_block_status() -> Dict[str, Any]:
     """Consulta estado do bloqueio lógico de risco agregado."""
     st = _load_state()
+    ks = kill_status()
     return {
-        "risk_block_active": bool(st.get("risk_block_active", False)),
+        "risk_block_active": bool(st.get("risk_block_active", False)) or bool(ks.get("active")),
         "block_attempts": int(st.get("block_attempts", 0)),
-        "baseline_tickets": st.get("baseline_tickets", [])
+        "baseline_tickets": st.get("baseline_tickets", []),
+        "kill_switch_active": bool(ks.get("active")),
+        "kill_switch_until": ks.get("until"),
     }
 
 # ---------------------------

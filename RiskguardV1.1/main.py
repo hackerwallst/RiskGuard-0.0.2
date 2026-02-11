@@ -1,4 +1,4 @@
-# main.py — RiskGuard (Modo Deus Neural) — bloqueio lógico, sem tocar no botão
+# main.py — RiskGuard (Modo Deus Neural) — bloqueio lógico + kill-switch temporário no agregado
 from __future__ import annotations
 import os, sys, time, json, random, webbrowser
 from datetime import datetime, timedelta, timezone, date
@@ -100,6 +100,11 @@ try:
     from limits.dd_kill import enforce_drawdown
 except Exception:
     enforce_drawdown = None
+
+try:
+    from limits.kill_switch import maybe_reenable_autotrade
+except Exception:
+    maybe_reenable_autotrade = None
 
 try:
     from reports import reports as reports_mod
@@ -240,7 +245,7 @@ PERTRADE_INTERACTIVE = get_bool("PERTRADE_INTERACTIVE", False)
 PERTRADE_INTERACTIVE_TIMEOUT_MIN = get_int("PERTRADE_INTERACTIVE_TIMEOUT_MIN", 15)
 TRADE_NOTIFICATIONS = get_bool("TRADE_NOTIFICATIONS", False)
 AGGREGATE_MAX_RISK = get_float("AGGREGATE_MAX_RISK", 5.0)         # %
-AGGREGATE_MAX_ATTEMPTS = get_int("AGGREGATE_MAX_ATTEMPTS", 3)     # segue monitorando tentativas (não toca no botão)
+AGGREGATE_MAX_ATTEMPTS = get_int("AGGREGATE_MAX_ATTEMPTS", 3)     # após X tentativas, aciona kill-switch no agregado
 
 DD_LIMIT_PCT = get_optional_float("DD_LIMIT_PCT", 20.0)           # % (None para desativar)
 DD_COOLDOWN_DAYS = get_int("DD_COOLDOWN_DAYS", 30)
@@ -636,6 +641,14 @@ def main():
             if not connected:
                 time.sleep(1)
                 continue
+
+            # Reativa AutoTrading automaticamente quando o kill-switch expirar.
+            if maybe_reenable_autotrade:
+                try:
+                    maybe_reenable_autotrade()
+                except Exception as e:
+                    log_event("ERROR", {"err": repr(e)}, {"module": "kill_switch"})
+
             try:
                 snap = reader.snapshot()
                 snapshot_fails = 0
@@ -699,7 +712,7 @@ def main():
             except Exception as e:
                 log_event("ERROR", {"err": repr(e)}, {"module":"per-trade"})
 
-            # 2) Agregado (5%) + tentativas (bloqueio lógico, sem botão)
+            # 2) Agregado (5%) + tentativas (bloqueio lógico + AutoTrading OFF temporário)
             try:
                 rep = enforce_aggregate_risk(reader,
                                              threshold_pct=AGGREGATE_MAX_RISK,
@@ -708,8 +721,14 @@ def main():
                 closed = rep.get("closed") or rep.get("tickets_closed") or rep.get("just_closed") or []
                 if isinstance(closed, dict): closed = [closed]
                 qty = len(closed) if hasattr(closed, "__len__") else (1 if closed else 0)
+                state_changed = bool(
+                    (rep.get("attempts_after") != rep.get("attempts_before")) or
+                    (rep.get("risk_block_active_after") != rep.get("risk_block_active_before")) or
+                    (rep.get("kill_switch_active_after") != rep.get("kill_switch_active_before")) or
+                    rep.get("kill_switch_armed_now")
+                )
 
-                if qty or rep.get("risk_block_active_after") or rep.get("attempts_after") != rep.get("attempts_before"):
+                if qty or state_changed:
                     lines = []
                     if qty:
                         shown = 0
@@ -725,13 +744,21 @@ def main():
                             shown += 1
                         if qty > shown:
                             lines.append(f"... e +{qty - shown} tickets")
-                    lines.append(f"Risco total ≤5%? {'SIM' if not rep.get('risk_block_active_after') else 'NÃO'}")
+                    total_risk_pct = float(rep.get("total_risk_pct") or 0.0)
+                    lines.append(f"Risco total ≤5%? {'SIM' if total_risk_pct <= AGGREGATE_MAX_RISK + 1e-9 else 'NÃO'}")
                     lines.append(f"Tentativas EA: {rep.get('attempts_after', 0)}")
                     if rep.get("risk_block_active_after"):
                         lines.append("🚫 BLOQUEIO DE RISCO ATIVO")
+                    if rep.get("kill_switch_armed_now"):
+                        lines.append(
+                            f"⏸️ AutoTrading OFF por {int(rep.get('block_minutes') or 60)} min "
+                            f"(até {rep.get('kill_switch_until_after')})"
+                        )
+                    elif rep.get("kill_switch_active_after") and rep.get("kill_switch_until_after"):
+                        lines.append(f"⏸️ AutoTrading OFF até {rep.get('kill_switch_until_after')}")
                     _rate_limited_alert("LIMITS (5%)", lines)
 
-                if rep.get("risk_block_active_after"):
+                if rep.get("risk_block_active_after") and not rep.get("risk_block_active_before"):
                     print("🚫 Bloqueio de risco ativo (>5%).", flush=True)
                     log_event("LIMITS", {"status": "bloqueio ativo"}, {"module":"limits"})
             except Exception as e:
